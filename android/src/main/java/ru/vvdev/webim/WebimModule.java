@@ -1,8 +1,10 @@
 package ru.vvdev.webim;
 
 import android.app.Activity;
+import android.text.TextUtils;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import android.webkit.MimeTypeMap;
@@ -37,16 +39,30 @@ import com.webimapp.android.sdk.WebimError;
 import com.webimapp.android.sdk.WebimSession;
 import com.webimapp.android.sdk.ProvidedAuthorizationTokenStateListener;
 
+import android.provider.DocumentsContract;
+import android.provider.MediaStore;
+import android.os.Environment;
+import android.content.ContentUris;
+import android.database.Cursor;
+import android.provider.OpenableColumns;
+import java.io.BufferedOutputStream;
+
 @SuppressWarnings("unused")
 public class WebimModule extends ReactContextBaseJavaModule implements MessageListener, ProvidedAuthorizationTokenStateListener, FatalErrorHandler, NotFatalErrorHandler {
     private static final int FILE_SELECT_CODE = 0;
     private static final String REACT_CLASS = "RNWebim";
     private static ReactApplicationContext reactContext = null;
+    public static final String DOCUMENTS_DIR = "documents";
 
     private Callback fileCbSuccess;
     private Callback fileCbFailure;
     private MessageTracker tracker;
     private WebimSession session;
+
+    private String parsedName;
+    private String parsedUri;
+
+    private Callback failureCbEx;
 
     WebimModule(ReactApplicationContext context) {
         super(context);
@@ -58,6 +74,7 @@ public class WebimModule extends ReactContextBaseJavaModule implements MessageLi
                 if (requestCode == FILE_SELECT_CODE) {
                     if (resultCode == Activity.RESULT_OK) {
                         Uri uri = data.getData();
+                        parsedUri = getPath(getContext(),uri);
                         Activity _activity = getContext().getCurrentActivity();
                         if (_activity != null && uri != null) {
                             String mime = _activity.getContentResolver().getType(uri);
@@ -66,7 +83,7 @@ public class WebimModule extends ReactContextBaseJavaModule implements MessageLi
                                     : MimeTypeMap.getSingleton().getExtensionFromMimeType(mime);
                             String name = extension == null
                                     ? null
-                                    : uri.getLastPathSegment() + "." + extension;
+                                    : uri.getLastPathSegment();
                             if (fileCbSuccess != null) {
                                 WritableMap _data = Arguments.createMap();
                                 _data.putString("uri", uri.toString());
@@ -76,7 +93,7 @@ public class WebimModule extends ReactContextBaseJavaModule implements MessageLi
                                 fileCbSuccess.invoke(_data);
                             }
                         } else {
-                            fileCbFailure.invoke(getSimpleMap("message", "unknown"));
+                            fileCbFailure.invoke(getSimpleMap("message", "unknown1"));
                         }
                         clearAttachCallbacks();
                         return;
@@ -272,12 +289,21 @@ public class WebimModule extends ReactContextBaseJavaModule implements MessageLi
             if (file != null) {
                 file.delete();
             }
-            failureCb.invoke(getSimpleMap("message", "unknown"));
+            failureCb.invoke(getSimpleMap("message", "unknown2"));
             return;
         }
         if (file != null && name != null) {
             final File fileToUpload = file;
-            session.getStream().sendFile(fileToUpload, name, mime, new MessageStream.SendFileCallback() {
+            if (parsedUri != null){
+                String [] parsedParts = parsedUri.split("/");
+                parsedName = parsedParts[parsedParts.length - 1];
+            }else if (name != null){
+            String [] parsedParts = name.split("/");
+             parsedName = parsedParts[parsedParts.length - 1] + "." + extension;
+            }else{
+             parsedName = "unknown.txt";
+            }
+            session.getStream().sendFile(fileToUpload, parsedName, mime, new MessageStream.SendFileCallback() {
                 @Override
                 public void onProgress(@NonNull Message.Id id, long sentBytes) {
                 }
@@ -300,9 +326,19 @@ public class WebimModule extends ReactContextBaseJavaModule implements MessageLi
                         case FILE_SIZE_EXCEEDED:
                             msg = "file size exceeded";
                             break;
+                        case FILE_NAME_INCORRECT:
+                            msg = "FILE_NAME_INCORRECT";
+                            break;
+                        case UNAUTHORIZED:
+                            msg = "UNAUTHORIZED";
+                            break;
+                        case UPLOADED_FILE_NOT_FOUND:
+                            msg = "UPLOADED_FILE_NOT_FOUND";
+                            break;
                         default:
-                            msg = "unknown";
+                            msg = "unknown3";
                     }
+
                     failureCb.invoke(getSimpleMap("message", msg));
                 }
             });
@@ -360,16 +396,28 @@ public class WebimModule extends ReactContextBaseJavaModule implements MessageLi
         map.putString("avatar", msg.getSenderAvatarUrl());
         map.putBoolean("read", msg.isReadByOperator());
         map.putBoolean("canEdit", msg.canBeEdited());
-        Message.Attachment attach = msg.getAttachment();
-        if (attach != null) {
-            WritableMap _att = Arguments.createMap();
-            _att.putString("contentType", attach.getContentType());
-            _att.putString("name", attach.getFileName());
-            _att.putString("info", "attach.getImageInfo().toString()");
-            _att.putDouble("size", attach.getSize());
-            _att.putString("url", attach.getUrl());
-            map.putMap("attachment", _att);
-        }
+
+        Message.Attachment attach1 = msg.getAttachment();
+
+        if (attach1 != null) {
+            Message.FileInfo attach = attach1.getFileInfo();
+            if (attach != null){
+                 WritableMap _att = Arguments.createMap();
+                             _att.putString("contentType", attach.getContentType());
+                             _att.putString("name", attach.getFileName());
+                             _att.putString("info", "attach.getImageInfo().toString()");
+                             _att.putDouble("size", attach.getSize());
+                             _att.putString("url", attach.getUrl());
+                             Message.ImageInfo attachImage = attach.getImageInfo();
+                             if (attachImage != null){
+                                _att.putString("url", attachImage.getThumbUrl());
+                             }else{
+                                _att.putString("url", attach.getUrl());
+                             }
+                             map.putMap("attachment", _att);
+            }
+         }
+
         return map;
     }
 
@@ -414,4 +462,292 @@ public class WebimModule extends ReactContextBaseJavaModule implements MessageLi
     public void onNotFatalError(@NonNull WebimError<NotFatalErrorType> error) {
         emitDeviceEvent("error", getSimpleMap("message", error.getErrorString()));
     }
+
+    /**
+     * Get a file path from a Uri. This will get the the path for Storage Access
+     * Framework Documents, as well as the _data field for the MediaStore and
+     * other file-based ContentProviders.
+     *
+     * @param context The context.
+     * @param uri The Uri to query.
+     * @author paulburke
+     */
+    public String getPath(final ReactApplicationContext context, final Uri uri) {
+
+        final boolean isKitKat = Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT;
+
+        // DocumentProvider
+        if (isKitKat && DocumentsContract.isDocumentUri(context, uri)) {
+            // ExternalStorageProvider
+            if (isExternalStorageDocument(uri)) {
+                final String docId = DocumentsContract.getDocumentId(uri);
+                final String[] split = docId.split(":");
+                final String type = split[0];
+
+                if ("primary".equalsIgnoreCase(type)) {
+                    return Environment.getExternalStorageDirectory() + "/" + split[1];
+                }
+
+                // TODO handle non-primary volumes
+            }
+            // DownloadsProvider
+            else if (isDownloadsDocument(uri)) {
+                        final String id = DocumentsContract.getDocumentId(uri);
+                        if (!TextUtils.isEmpty(id)) {
+                        if (id.startsWith("raw:")) {
+                            return id.replaceFirst("raw:", "");
+                        }
+
+                         String[] contentUriPrefixesToTry = new String[]{
+                                                "content://downloads/public_downloads",
+                                                "content://downloads/my_downloads",
+                                                "content://downloads/all_downloads"
+                                        };
+
+                         for (String contentUriPrefix : contentUriPrefixesToTry) {
+                             try {
+                                 final Uri contentUri = ContentUris.withAppendedId(
+                                            Uri.parse(contentUriPrefix), Long.valueOf(id));
+                                 String path = getDataColumn(context, contentUri, null, null);
+                                 if (path != null) {
+                                    return path;
+                                 }
+                             } catch (NumberFormatException e) {
+
+                             }
+                         }
+
+                         // path could not be retrieved using ContentResolver, therefore copy file to accessible cache using streams
+                         String fileName = getFileName(context,uri);
+                         File cacheDir = getDocumentCacheDir(context);
+                         File file = generateFileName(fileName, cacheDir);
+                         String destinationPath = null;
+                         if (file != null) {
+                            destinationPath = file.getAbsolutePath();
+                            saveFileFromUri(context, uri, destinationPath);
+                         }
+
+                         return destinationPath;
+
+
+                        }
+                    }
+            // MediaProvider
+            else if (isMediaDocument(uri)) {
+                final String docId = DocumentsContract.getDocumentId(uri);
+                final String[] split = docId.split(":");
+                final String type = split[0];
+
+                Uri contentUri = null;
+                if ("image".equals(type)) {
+                    contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
+                } else if ("video".equals(type)) {
+                    contentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI;
+                } else if ("audio".equals(type)) {
+                    contentUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
+                }
+
+                final String selection = "_id=?";
+                final String[] selectionArgs = new String[] {
+                        split[1]
+                };
+
+                return getDataColumn(context, contentUri, selection, selectionArgs);
+            }
+        }
+        // MediaStore (and general)
+        else if ("content".equalsIgnoreCase(uri.getScheme())) {
+
+            // Return the remote address
+            if (isGooglePhotosUri(uri))
+                return uri.getLastPathSegment();
+
+            return getDataColumn(context, uri, null, null);
+        }
+        // File
+        else if ("file".equalsIgnoreCase(uri.getScheme())) {
+            return uri.getPath();
+        }
+
+        return null;
+    }
+
+    /**
+         * Get the value of the data column for this Uri. This is useful for
+         * MediaStore Uris, and other file-based ContentProviders.
+         *
+         * @param context       The context.
+         * @param uri           The Uri to query.
+         * @param selection     (Optional) Filter used in the query.
+         * @param selectionArgs (Optional) Selection arguments used in the query.
+         * @return The value of the _data column, which is typically a file path.
+         */
+        public static String getDataColumn(ReactApplicationContext context, Uri uri, String selection,
+                                           String[] selectionArgs) {
+
+            Cursor cursor = null;
+            final String column = MediaStore.Files.FileColumns.DATA;
+            final String[] projection = {
+                    column
+            };
+
+            try {
+                cursor = context.getContentResolver().query(uri, projection, selection, selectionArgs,
+                        null);
+                if (cursor != null && cursor.moveToFirst()) {
+
+                    final int column_index = cursor.getColumnIndexOrThrow(column);
+                    return cursor.getString(column_index);
+                }
+            }  catch (Exception e) {
+
+            } finally {
+                if (cursor != null)
+                    cursor.close();
+            }
+            return null;
+        }
+
+
+
+    /**
+     * @param uri The Uri to check.
+     * @return Whether the Uri authority is ExternalStorageProvider.
+     */
+    public boolean isExternalStorageDocument(Uri uri) {
+        return "com.android.externalstorage.documents".equals(uri.getAuthority());
+    }
+
+    /**
+     * @param uri The Uri to check.
+     * @return Whether the Uri authority is DownloadsProvider.
+     */
+    public boolean isDownloadsDocument(Uri uri) {
+        return "com.android.providers.downloads.documents".equals(uri.getAuthority());
+    }
+
+    /**
+     * @param uri The Uri to check.
+     * @return Whether the Uri authority is MediaProvider.
+     */
+    public boolean isMediaDocument(Uri uri) {
+        return "com.android.providers.media.documents".equals(uri.getAuthority());
+    }
+
+    /**
+     * @param uri The Uri to check.
+     * @return Whether the Uri authority is Google Photos.
+     */
+    public boolean isGooglePhotosUri(Uri uri) {
+        return "com.google.android.apps.photos.content".equals(uri.getAuthority());
+    }
+
+     public String getFileName(@NonNull ReactApplicationContext context, Uri uri) {
+            String mimeType = context.getContentResolver().getType(uri);
+            String filename = null;
+
+            if (mimeType == null && context != null) {
+                String path = getPath1(context, uri);
+                if (path == null) {
+                    filename = getName1(uri.toString());
+                } else {
+                    File file = new File(path);
+                    filename = file.getName();
+                }
+            } else {
+                Cursor returnCursor = context.getContentResolver().query(uri, null,
+                        null, null, null);
+                if (returnCursor != null) {
+                    int nameIndex = returnCursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    returnCursor.moveToFirst();
+                    filename = returnCursor.getString(nameIndex);
+                    returnCursor.close();
+                }
+            }
+
+            return filename;
+        }
+
+        public String getPath1(final ReactApplicationContext context, final Uri uri) {
+                String absolutePath = getPath(context, uri);
+                return absolutePath != null ? absolutePath : uri.toString();
+            }
+
+    public File getDocumentCacheDir(@NonNull ReactApplicationContext context) {
+            File dir = new File(context.getCacheDir(), DOCUMENTS_DIR);
+            if (!dir.exists()) {
+                dir.mkdirs();
+            }
+
+            return dir;
+        }
+
+    @Nullable
+    public File generateFileName(@Nullable String name, File directory) {
+            if (name == null) {
+                return null;
+            }
+
+            File file = new File(directory, name);
+
+            if (file.exists()) {
+                String fileName = name;
+                String extension = "";
+                int dotIndex = name.lastIndexOf('.');
+                if (dotIndex > 0) {
+                    fileName = name.substring(0, dotIndex);
+                    extension = name.substring(dotIndex);
+                }
+
+                int index = 0;
+
+                while (file.exists()) {
+                    index++;
+                    name = fileName + '(' + index + ')' + extension;
+                    file = new File(directory, name);
+                }
+            }
+
+            try {
+                if (!file.createNewFile()) {
+                    return null;
+                }
+            } catch (IOException e) {
+                return null;
+            }
+
+
+            return file;
+    }
+
+    private void saveFileFromUri(ReactApplicationContext context, Uri uri, String destinationPath) {
+            InputStream is = null;
+            BufferedOutputStream bos = null;
+            try {
+                is = context.getContentResolver().openInputStream(uri);
+                bos = new BufferedOutputStream(new FileOutputStream(destinationPath, false));
+                byte[] buf = new byte[1024];
+                is.read(buf);
+                do {
+                    bos.write(buf);
+                } while (is.read(buf) != -1);
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    if (is != null) is.close();
+                    if (bos != null) bos.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+    }
+
+    public String getName1(String filename) {
+            if (filename == null) {
+                return null;
+            }
+            int index = filename.lastIndexOf('/');
+            return filename.substring(index + 1);
+        }
 }
